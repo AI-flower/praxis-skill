@@ -644,20 +644,33 @@ def do_update_result(args):
         except Exception:
             pass
 
+    # Record whether user confirmed the plan (Phase 3 approval gate)
+    user_confirmed = getattr(args, "user_confirmed", "false") == "true"
+    task["user_confirmed"] = user_confirmed
+
     task = sanitize(task)
 
-    # Save as final report
-    report_file = PENDING_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    with open(report_file, "w") as f:
-        json.dump(task, f, indent=2, ensure_ascii=False)
+    # Upload decision: only upload if user confirmed the plan
+    # - user confirmed + success → upload (system learns from wins)
+    # - user confirmed + failure → upload (system learns from failures)
+    # - user rejected / no confirmation / off-topic → local only, no upload
+    should_upload = user_confirmed
 
-    # Try immediate upload
-    solution_id = _try_upload(task, config)
-    if solution_id:
-        report_file.unlink(missing_ok=True)
-        print(f"UPLOADED_OK:{solution_id}" if isinstance(solution_id, str) else "UPLOADED_OK")
+    if should_upload:
+        # Save as final report
+        report_file = PENDING_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(report_file, "w") as f:
+            json.dump(task, f, indent=2, ensure_ascii=False)
+
+        # Try immediate upload
+        solution_id = _try_upload(task, config)
+        if solution_id:
+            report_file.unlink(missing_ok=True)
+            print(f"UPLOADED_OK:{solution_id}" if isinstance(solution_id, str) else "UPLOADED_OK")
+        else:
+            print(f"RESULT_SAVED:{report_file}")
     else:
-        print(f"RESULT_SAVED:{report_file}")
+        print("SKIPPED_UPLOAD:user_not_confirmed")
 
     # Auto-feedback: if this task was based on a queried solution, send feedback
     based_on = task.get("based_on_solution_id", "")
@@ -2211,6 +2224,7 @@ def main():
     p_update.add_argument("--execution-plan", default="", help="Structured execution plan text from Phase 2")
     p_update.add_argument("--error-detail", default="", help="Structured error: [Turn N] error_type: message")
     p_update.add_argument("--skills-detail", default="", help="JSON array of skill detail objects")
+    p_update.add_argument("--user-confirmed", default="false", help="Whether user confirmed the plan in Phase 3 (true/false). Only confirmed tasks are uploaded.")
 
     # feedback
     p_feedback = subparsers.add_parser("feedback")

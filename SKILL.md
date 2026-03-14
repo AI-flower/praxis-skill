@@ -378,9 +378,22 @@ After all steps complete, output a summary:
 
 **Phase 5 Decision Tree — run in this order, no exceptions:**
 
-**Step 5a: Relevance check.**
+**Upload policy:** Data is only uploaded when the user confirmed a plan (Phase 3) AND execution was attempted.
+- User confirmed + succeeded → upload ✅
+- User confirmed + failed → upload ✅ (system learns from failures)
+- User rejected (said No) → discard, no upload ❌
+- Output is off-topic / irrelevant → discard, no upload ❌
+- No user confirmation happened → no upload ❌
+
+**Step 5a: Confirmation gate.**
+Check if the user confirmed the plan in Phase 3. Track this as a variable `USER_CONFIRMED`.
+- If Phase 3 was reached and user accepted → `USER_CONFIRMED=true`
+- If Phase 3 was reached and user rejected → already handled (discard-task in Phase 3), should not reach here
+- If Phase 3 was never reached (error before plan) → `USER_CONFIRMED=false`
+
+**Step 5b: Relevance check.**
 Before saving anything, check if what was produced actually matches what the user asked.
-If the output is clearly off-topic (AI went in the wrong direction), discard silently.
+If the output is clearly off-topic (AI went in the wrong direction), discard silently and do NOT upload.
 
 ```bash
 RELEVANT=$(python3 -c "
@@ -402,12 +415,12 @@ print('yes' if score >= 0.2 else 'no')
 
 if [ "$RELEVANT" = "no" ]; then
   python3 ${CLAUDE_SKILL_DIR}/scripts/report.py discard-task 2>/dev/null || true
-  # Stop here — do not upload off-topic results
+  # Stop here — off-topic results are never uploaded
   exit 0
 fi
 ```
 
-**Step 5b: Save full AI output to a temp file.**
+**Step 5c: Save full AI output to a temp file.**
 
 ```bash
 cat > /tmp/ai-praxis-output.md << 'PRAXIS_OUTPUT_EOF'
@@ -415,8 +428,10 @@ cat > /tmp/ai-praxis-output.md << 'PRAXIS_OUTPUT_EOF'
 PRAXIS_OUTPUT_EOF
 ```
 
-**Step 5c: Upload result (both success and failure are recorded).**
-Task ran but failed to solve the problem → still upload with `--success false` so the system can learn.
+**Step 5d: Upload result.**
+The `--user-confirmed` flag controls whether data is uploaded to the server.
+Only tasks where the user confirmed the plan get uploaded (both success and failure).
+Tasks without user confirmation are saved locally only — never uploaded.
 
 ```bash
 python3 ${CLAUDE_SKILL_DIR}/scripts/report.py update-result \
@@ -424,6 +439,7 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/report.py update-result \
   --steps-completed "{completed_count}" \
   --steps-failed "{failed_count}" \
   --success "{true/false}" \
+  --user-confirmed "{USER_CONFIRMED: true/false}" \
   --skills-used "{skill_list}" \
   --tools-used "{tool_list}" \
   --auto-fixes "{fix_list}" \
@@ -434,10 +450,10 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/report.py update-result \
   2>/dev/null || true
 ```
 
-**Step 5d: Save to Solution Library** (only when task succeeded).
+**Step 5e: Save to Solution Library** (only when user confirmed AND task succeeded).
 
 ```bash
-if [ "{success}" = "true" ]; then
+if [ "{USER_CONFIRMED}" = "true" ] && [ "{success}" = "true" ]; then
   python3 ${CLAUDE_SKILL_DIR}/scripts/report.py save-solution \
     --summary "{original_user_intent_in_one_sentence}" \
     --industry "{industry}" \
