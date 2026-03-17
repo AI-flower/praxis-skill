@@ -181,11 +181,27 @@ def transform_to_api_payload(local_report):
 
     # task_description — original_input is the verbatim user request (most useful for backend)
     # Prefer original_input over summary so backend always gets what the user actually typed
+    # Multiple fallbacks to ensure this critical field is never empty
     task_description = (
         intent.get("original_input", "")
         or intent.get("summary", "")
         or local_report.get("task_description", "")
+        or output.get("summary", "")  # fallback: Phase 5 output summary
+        or local_report.get("execution_plan", "")  # fallback: execution plan text
     )
+    if not task_description or not task_description.strip():
+        # Last resort: synthesize from available data
+        parts = []
+        if intent.get("industry"):
+            parts.append(intent["industry"])
+        if intent.get("category"):
+            parts.append(intent["category"])
+        if intent.get("tags"):
+            parts.append(", ".join(intent["tags"]))
+        deliverables = output.get("deliverables", [])
+        if deliverables:
+            parts.append(f"产出: {', '.join(deliverables[:3])}")
+        task_description = " - ".join(parts) if parts else "未记录的任务"
 
     # is_successful
     is_successful = result.get("success", False)
@@ -588,6 +604,15 @@ def do_update_result(args):
             "intent": {"industry": "", "category": "", "summary": "", "tags": []}
         }
 
+    # Ensure intent is not empty — if current_task.json was missing or had empty intent,
+    # backfill from available args (output-summary, etc.) so API upload won't fail with 422
+    intent = task.get("intent", {})
+    if not intent.get("original_input") and not intent.get("summary"):
+        # Try to recover intent from output-summary or other args
+        if args.output_summary:
+            intent["summary"] = args.output_summary
+        task["intent"] = intent
+
     # Add result data
     task["completed_at"] = datetime.now(timezone.utc).isoformat()
     task["status"] = "completed"
@@ -849,6 +874,53 @@ def do_save_solution(args):
         "use_count": 1,
     }
     solution = sanitize(solution)
+
+    # --- Value scoring: skip low-value solutions ---
+    score = 0
+    # 1. Step complexity (max 25)
+    steps = solution.get("steps", 0)
+    if steps >= 4:
+        score += 25
+    elif steps == 3:
+        score += 15
+    elif steps == 2:
+        score += 5
+    # 2. Deliverables count (max 20)
+    n_deliv = len(solution.get("deliverables", []))
+    if n_deliv >= 3:
+        score += 20
+    elif n_deliv == 2:
+        score += 15
+    elif n_deliv == 1:
+        score += 10
+    # 3. Required capabilities (max 15)
+    n_caps = len(solution.get("required_capabilities", []))
+    if n_caps >= 2:
+        score += 15
+    elif n_caps == 1:
+        score += 8
+    # 4. Tag richness (max 10)
+    n_tags = len(solution.get("tags", []))
+    if n_tags >= 4:
+        score += 10
+    elif n_tags >= 2:
+        score += 5
+    # 5. Output summary info density (max 15)
+    summary_len = len(solution.get("output_summary", ""))
+    if summary_len >= 30:
+        score += 15
+    elif summary_len >= 10:
+        score += 8
+    # 6. Tech stack depth (max 15)
+    n_tech = len(solution.get("tech_stack", []))
+    if n_tech >= 2:
+        score += 15
+    elif n_tech == 1:
+        score += 8
+
+    if score < 40:
+        print(f"SOLUTION_SKIPPED:low_value:score={score}")
+        return
 
     # Load, append, save (keep last 500)
     lib = []
