@@ -853,9 +853,55 @@ def do_search_solutions(args):
         print(f"SOLUTIONS_JSON:{json.dumps(top, ensure_ascii=False)}")
 
 
+_SOLUTION_VALUE_THRESHOLD = 40
+
+# (dimension_key, thresholds): each threshold is (min_value, points), evaluated top-down
+_SCORING_DIMENSIONS = [
+    ("steps",                [(4, 25), (3, 15), (2, 5)]),
+    ("deliverables",         [(3, 20), (2, 15), (1, 10)]),
+    ("required_capabilities", [(2, 15), (1, 8)]),
+    ("tags",                 [(4, 10), (2, 5)]),
+    ("output_summary_len",   [(30, 15), (10, 8)]),
+    ("tech_stack",           [(2, 15), (1, 8)]),
+]
+
+
+def _score_solution_value(metrics: dict) -> int:
+    """Score a solution's reuse value (0-100) from dimension metrics.
+
+    metrics keys: steps (int), deliverables (int), required_capabilities (int),
+                  tags (int), output_summary_len (int), tech_stack (int).
+    """
+    score = 0
+    for key, thresholds in _SCORING_DIMENSIONS:
+        value = metrics.get(key, 0)
+        for min_val, points in thresholds:
+            if value >= min_val:
+                score += points
+                break
+    return score
+
+
 def do_save_solution(args):
     """Save a completed solution to local library and optionally upload."""
     config = get_config()
+
+    # --- Value scoring gate: check BEFORE building full dict / sanitize ---
+    def _count_csv(raw):
+        return len([t.strip() for t in (raw or "").split(",") if t.strip()])
+
+    metrics = {
+        "steps": int(args.steps or 0),
+        "deliverables": _count_csv(args.deliverables),
+        "required_capabilities": _count_csv(args.required_capabilities),
+        "tags": _count_csv(args.tags),
+        "output_summary_len": len(args.output_summary or ""),
+        "tech_stack": _count_csv(getattr(args, "tech_stack", None)),
+    }
+    score = _score_solution_value(metrics)
+    if score < _SOLUTION_VALUE_THRESHOLD:
+        print(f"SOLUTION_SKIPPED:low_value:score={score}")
+        return
 
     solution = {
         "id": str(uuid.uuid4()),
@@ -864,7 +910,7 @@ def do_save_solution(args):
         "industry": args.industry or "",
         "category": args.category or "",
         "tags": [t.strip() for t in (args.tags or "").split(",") if t.strip()],
-        "steps": int(args.steps or 0),
+        "steps": metrics["steps"],
         "success": args.success == "true",
         "output_summary": args.output_summary or "",
         "deliverables": [d.strip() for d in (args.deliverables or "").split(",") if d.strip()],
@@ -874,53 +920,6 @@ def do_save_solution(args):
         "use_count": 1,
     }
     solution = sanitize(solution)
-
-    # --- Value scoring: skip low-value solutions ---
-    score = 0
-    # 1. Step complexity (max 25)
-    steps = solution.get("steps", 0)
-    if steps >= 4:
-        score += 25
-    elif steps == 3:
-        score += 15
-    elif steps == 2:
-        score += 5
-    # 2. Deliverables count (max 20)
-    n_deliv = len(solution.get("deliverables", []))
-    if n_deliv >= 3:
-        score += 20
-    elif n_deliv == 2:
-        score += 15
-    elif n_deliv == 1:
-        score += 10
-    # 3. Required capabilities (max 15)
-    n_caps = len(solution.get("required_capabilities", []))
-    if n_caps >= 2:
-        score += 15
-    elif n_caps == 1:
-        score += 8
-    # 4. Tag richness (max 10)
-    n_tags = len(solution.get("tags", []))
-    if n_tags >= 4:
-        score += 10
-    elif n_tags >= 2:
-        score += 5
-    # 5. Output summary info density (max 15)
-    summary_len = len(solution.get("output_summary", ""))
-    if summary_len >= 30:
-        score += 15
-    elif summary_len >= 10:
-        score += 8
-    # 6. Tech stack depth (max 15)
-    n_tech = len(solution.get("tech_stack", []))
-    if n_tech >= 2:
-        score += 15
-    elif n_tech == 1:
-        score += 8
-
-    if score < 40:
-        print(f"SOLUTION_SKIPPED:low_value:score={score}")
-        return
 
     # Load, append, save (keep last 500)
     lib = []
