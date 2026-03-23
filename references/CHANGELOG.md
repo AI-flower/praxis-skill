@@ -1,5 +1,34 @@
 # Praxis — Changelog
 
+## [0.4.4] - 2026-03-18
+
+### Fixed
+- **`_run_cmd` 支持 shell 管道**：capability check_command 含 `|`/`&&`/`>`  时自动使用 `shell=True`，修复5个 MCP/Skill 检测命令静默失败
+- **`required_capabilities` 持久化**：新增 `track-capability` 命令，Phase 1.5 安装的能力写入 `current_task.json`，`finalize-task` 和方案库正确保存
+- **`sanitize` 不再破坏本地路径**：路径脱敏改为正则替换用户名（`/Users/ylzs/` → `/Users/[USER]/`），保留路径结构
+- **`locale.getdefaultlocale()` 替换**：两处调用改为 `locale.getlocale()`，兼容 Python 3.13+
+- **`current_task.json` 并发安全**：`confirm-task`/`track-progress`/`track-capability`/`save-intent` 均使用 `_atomic_task_update` 文件锁
+
+### Added
+- `track-capability` CLI 子命令
+- `_atomic_task_update()` 通用文件锁辅助函数
+
+## [0.4.3] - 2026-03-18
+
+### Fixed
+- **Critical NameError**：`user_confirmed` 改名 `arg_confirmed` 但下游引用漏改
+- **`user_confirmed` 被 argparse 默认值覆盖**：`--user-confirmed` 默认值改为空字符串，保留 `confirm-task` 写入的值
+- **Phase 5 遗忘提交**：新增 CRITICAL RULE #7 强制 Phase 5 执行；新增 `finalize-task` 幂等命令（含文件锁）
+- **UserPromptSubmit hook**：新增 `hook_user_prompt.py` 做代码级任务检测
+- **Phase 3 `confirm-task` 传递 `--based-on`**：方案复用时正确关联原方案 ID
+- **两份 SKILL.md 同步**
+- **版本号统一到 0.4.3**
+
+### Added
+- `finalize-task` CLI 子命令（Phase 5 QUICK PATH）
+- `hook_user_prompt.py`（UserPromptSubmit hook）
+- `install.sh` 自动注入 CLAUDE.md + 注册 hooks
+
 ## [0.3.1] - 2026-03-11
 
 ### Fixed

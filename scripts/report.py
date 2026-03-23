@@ -92,7 +92,7 @@ def detect_locale():
     """Detect user locale."""
     import locale
     try:
-        lang = locale.getdefaultlocale()[0] or "en_US"
+        lang = locale.getlocale()[0] or "en_US"
         return lang.replace("_", "-")
     except Exception:
         return "en-US"
@@ -106,7 +106,6 @@ def sanitize(data):
     TODO: Enhance with more comprehensive PII detection.
     """
     sensitive_patterns = [
-        "/Users/", "/home/", "C:\\Users\\",  # file paths
         "sk-", "ghp_", "gho_", "Bearer ",     # API keys
         "@gmail", "@outlook", "@qq.com",       # emails
     ]
@@ -114,10 +113,13 @@ def sanitize(data):
     def clean_str(s):
         if not isinstance(s, str):
             return s
+        import re
+        # Redact username from file paths while preserving path structure
+        s = re.sub(r'/(Users|home)/[^/]+/', r'/\1/[USER]/', s)
+        s = re.sub(r'C:\\Users\\[^\\]+\\', r'C:\\Users\\[USER]\\', s)
         for pattern in sensitive_patterns:
             if pattern in s:
-                # Replace with redacted marker
-                s = s.replace(pattern, "[REDACTED]/")
+                s = s.replace(pattern, "[REDACTED]")
         return s
 
     if isinstance(data, dict):
@@ -127,6 +129,29 @@ def sanitize(data):
     elif isinstance(data, str):
         return clean_str(data)
     return data
+
+
+def _atomic_task_update(modifier_fn):
+    """Atomically read-modify-write current_task.json with file locking.
+    modifier_fn(task_dict) -> status_string. Modifies task dict in place."""
+    import fcntl
+    lock_file = CONFIG_DIR / ".task.lock"
+    lock_file.touch(exist_ok=True)
+    lock_fd = open(lock_file, "r")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if not CURRENT_TASK_FILE.exists():
+            return "NO_TASK"
+        task = json.loads(CURRENT_TASK_FILE.read_text())
+        result = modifier_fn(task)
+        with open(CURRENT_TASK_FILE, "w") as f:
+            json.dump(task, f, indent=2, ensure_ascii=False)
+        return result
+    except Exception as e:
+        return f"ERROR:{e}"
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
 
 
 # --- HTTP & Transform ---
@@ -552,6 +577,279 @@ def do_discard_task(args):
     print("TASK_DISCARDED")
 
 
+def do_confirm_task(args):
+    """Mark current task as user-confirmed (Phase 3 acceptance).
+    This flag tells the hook that the task was approved and results should be uploaded."""
+    def _confirm(task):
+        task["user_confirmed"] = True
+        task["confirmed_at"] = datetime.now(timezone.utc).isoformat()
+        if getattr(args, "based_on", "") and args.based_on:
+            task["based_on_solution_id"] = args.based_on
+        return "TASK_CONFIRMED"
+    result = _atomic_task_update(_confirm)
+    print(result)
+
+
+def do_track_progress(args):
+    """Append a progress entry to current_task.json (Phase 4 incremental tracking).
+    Each completed step is recorded so the hook can synthesize a report if Phase 5 is lost."""
+    def _track(task):
+        progress = task.setdefault("progress", [])
+        entry = {
+            "step": args.step_completed or "",
+            "deliverable": args.deliverable or "",
+            "tool": args.tool_used or "",
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        progress.append(entry)
+        task["last_activity"] = entry["at"]
+        return f"PROGRESS:{len(progress)}"
+    result = _atomic_task_update(_track)
+    print(result)
+
+
+def do_track_capability(args):
+    """Record an installed capability in current_task.json for Phase 5 reporting."""
+    def _track_cap(task):
+        caps = task.setdefault("installed_capabilities", [])
+        if args.name not in caps:
+            caps.append(args.name)
+        return f"CAPABILITY_TRACKED:{args.name}"
+    result = _atomic_task_update(_track_cap)
+    print(result)
+
+
+def do_finalize_task(args):
+    """Simplified Phase 5: auto-aggregate data from current_task.json and finalize.
+
+    Combines update-result + save-solution into one idempotent command.
+    LLM only needs to pass --success and --output-summary; everything else
+    is read from current_task.json (populated by save-intent, confirm-task,
+    and track-progress during earlier phases).
+
+    Uses file locking to prevent race conditions with the Stop hook.
+    """
+    import fcntl
+
+    config = get_config()
+
+    if not CURRENT_TASK_FILE.exists():
+        print("NO_TASK")
+        return
+
+    lock_file = CONFIG_DIR / ".finalize.lock"
+    lock_file.touch(exist_ok=True)
+    lock_fd = open(lock_file, "r")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError):
+        # Another process holds the lock — it's already finalizing
+        print("ALREADY_FINALIZING")
+        lock_fd.close()
+        return
+
+    try:
+        # Re-check after acquiring lock (file may have been deleted by other process)
+        if not CURRENT_TASK_FILE.exists():
+            print("NO_TASK")
+            return
+
+        task = json.loads(CURRENT_TASK_FILE.read_text())
+        task_id = task.get("task_id", "")
+
+        # Idempotency: check if report for this task already exists
+        if task_id:
+            for existing in PENDING_DIR.glob("*.json"):
+                try:
+                    if json.loads(existing.read_text()).get("task_id") == task_id:
+                        CURRENT_TASK_FILE.unlink(missing_ok=True)
+                        print("ALREADY_FINALIZED")
+                        return
+                except Exception:
+                    continue
+
+        # --- Aggregate data from current_task.json ---
+        progress = task.get("progress", [])
+        intent = task.get("intent", {})
+        started_at = task.get("started_at", "")
+        last_activity = task.get("last_activity", "")
+
+        steps_completed = len(progress)
+        tools_used = list({e.get("tool", "") for e in progress if e.get("tool")})
+        deliverables = list({e.get("deliverable", "") for e in progress if e.get("deliverable")})
+
+        # Calculate duration
+        duration = 0
+        if started_at and last_activity:
+            try:
+                t_start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                t_end = datetime.fromisoformat(last_activity.replace("Z", "+00:00"))
+                duration = max(0, int((t_end - t_start).total_seconds()))
+            except Exception:
+                pass
+
+        # Build summary from progress step descriptions if not provided
+        output_summary = args.output_summary or ""
+        if not output_summary:
+            step_descs = [e.get("step", "") for e in progress[:5] if e.get("step")]
+            output_summary = "; ".join(step_descs) if step_descs else intent.get("summary", "")
+
+        # --- Write result fields ---
+        now_iso = datetime.now(timezone.utc).isoformat()
+        task["completed_at"] = now_iso
+        task["status"] = "completed"
+        task["report_version"] = "1.5.0"
+        task["schema_version"] = "2.1"
+        task["plan"] = {
+            "steps_count": steps_completed,
+            "skills_used": ["praxis"],
+            "tools_used": tools_used,
+            "auto_fixes": [],
+        }
+        task["result"] = {
+            "success": args.success == "true",
+            "steps_completed": steps_completed,
+            "steps_failed": 0,
+            "duration_seconds": duration,
+        }
+        task["output"] = {
+            "summary": output_summary,
+            "deliverables": deliverables,
+            "full_content_file": "",
+        }
+
+        # Save full output content if provided
+        if args.output_file and Path(args.output_file).exists():
+            try:
+                content = Path(args.output_file).read_text(errors="ignore")
+                if content.strip():
+                    output_dir = CONFIG_DIR / "outputs"
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    output_filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_output.md"
+                    output_path = output_dir / output_filename
+                    with open(output_path, "w") as f:
+                        f.write(content)
+                    task["output"]["full_content_file"] = str(output_path)
+                    task["output"]["preview"] = content[:500].strip()
+            except Exception:
+                pass
+
+        # user_confirmed: preserved from confirm-task (Phase 3), never overridden here
+        user_confirmed = task.get("user_confirmed", False)
+
+        task = sanitize(task)
+
+        # --- Write pending report ---
+        PENDING_DIR.mkdir(parents=True, exist_ok=True)
+        report_file = PENDING_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(report_file, "w") as f:
+            json.dump(task, f, indent=2, ensure_ascii=False)
+
+        # --- Upload if user confirmed ---
+        if user_confirmed:
+            solution_id = _try_upload(task, config)
+            if solution_id:
+                report_file.unlink(missing_ok=True)
+
+        # --- Auto-feedback for solution replay ---
+        based_on = task.get("based_on_solution_id", "")
+        if based_on and config.get("report_enabled"):
+            endpoint = config.get("community_api_endpoint", "").rstrip("/")
+            if endpoint:
+                fb_type = "upvote" if task.get("result", {}).get("success") else "downvote"
+                _api_post(
+                    f"{endpoint}/api/solutions/{based_on}/feedback",
+                    {"type": fb_type},
+                    config.get("api_key", "")
+                )
+
+        # --- Save to solution library (only if confirmed + success) ---
+        if user_confirmed and args.success == "true":
+            _auto_save_solution(task, config)
+
+        # --- Cleanup ---
+        CURRENT_TASK_FILE.unlink(missing_ok=True)
+        print("FINALIZED")
+
+    except Exception as e:
+        print(f"FINALIZE_ERROR:{e}")
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+
+
+def _auto_save_solution(task, config):
+    """Internal helper: save solution to library if it passes the value scoring gate.
+    Reuses the same scoring and storage logic as do_save_solution."""
+    intent = task.get("intent", {})
+    progress = task.get("progress", [])
+    output = task.get("output", {})
+
+    tags = intent.get("tags", [])
+    deliverables = output.get("deliverables", [])
+    tech_stack = intent.get("tech_stack", [])
+    output_summary = output.get("summary", "")
+
+    # Value scoring gate
+    metrics = {
+        "steps": len(progress),
+        "deliverables": len(deliverables),
+        "required_capabilities": len(task.get("installed_capabilities", [])),
+        "tags": len(tags),
+        "output_summary_len": len(output_summary),
+        "tech_stack": len(tech_stack),
+    }
+    score = _score_solution_value(metrics)
+    if score < _SOLUTION_VALUE_THRESHOLD:
+        return  # Too trivial to save
+
+    solution = {
+        "id": str(uuid.uuid4()),
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "summary": intent.get("summary", ""),
+        "industry": intent.get("industry", ""),
+        "category": intent.get("category", ""),
+        "tags": tags,
+        "steps": len(progress),
+        "success": task.get("result", {}).get("success", True),
+        "output_summary": output_summary,
+        "deliverables": deliverables,
+        "required_capabilities": task.get("installed_capabilities", []),
+        "artifacts_summary": [],
+        "tech_stack": tech_stack,
+        "use_count": 1,
+    }
+    solution = sanitize(solution)
+
+    # Load, append, save (keep last 500)
+    lib = []
+    if SOLUTION_LIBRARY_FILE.exists():
+        try:
+            lib = json.load(open(SOLUTION_LIBRARY_FILE))
+        except Exception:
+            lib = []
+    lib.append(solution)
+    lib = lib[-500:]
+    SOLUTION_LIBRARY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(SOLUTION_LIBRARY_FILE, "w") as f:
+        json.dump(lib, f, indent=2, ensure_ascii=False)
+
+    # Try upload
+    if config.get("report_enabled") and config.get("community_api_endpoint"):
+        api_payload = {
+            "task_description": solution["summary"],
+            "industry": solution["industry"],
+            "category": solution["category"],
+            "tags": solution["tags"],
+            "skills": [{"name": "praxis", "description": "", "content": ""}],
+            "execution_plan": f"共{solution['steps']}步",
+            "is_successful": solution["success"],
+            "required_capabilities": solution["required_capabilities"],
+        }
+        endpoint = config["community_api_endpoint"].rstrip("/")
+        _api_post(f"{endpoint}/api/solutions", api_payload, config.get("api_key", ""))
+
+
 def do_save_intent(args):
     """Save intent early in Phase 1, before plan generation.
     This ensures we capture the user's need even if Phase 5 is skipped."""
@@ -578,10 +876,20 @@ def do_save_intent(args):
 
     task = sanitize(task)
 
-    with open(CURRENT_TASK_FILE, "w") as f:
-        json.dump(task, f, indent=2, ensure_ascii=False)
-
-    print(f"INTENT_SAVED:{CURRENT_TASK_FILE}")
+    import fcntl
+    lock_file = CONFIG_DIR / ".task.lock"
+    lock_file.touch(exist_ok=True)
+    lock_fd = open(lock_file, "r")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        with open(CURRENT_TASK_FILE, "w") as f:
+            json.dump(task, f, indent=2, ensure_ascii=False)
+        print(f"INTENT_SAVED:{CURRENT_TASK_FILE}")
+    except Exception as e:
+        print(f"SAVE_INTENT_ERROR:{e}")
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
 
 
 def do_update_result(args):
@@ -670,8 +978,11 @@ def do_update_result(args):
             pass
 
     # Record whether user confirmed the plan (Phase 3 approval gate)
-    user_confirmed = getattr(args, "user_confirmed", "false") == "true"
-    task["user_confirmed"] = user_confirmed
+    # Only override if explicitly passed; preserve confirm-task's value otherwise
+    arg_confirmed = getattr(args, "user_confirmed", None)
+    if arg_confirmed is not None and arg_confirmed != "":
+        task["user_confirmed"] = arg_confirmed == "true"
+    # else: keep existing value from confirm-task (Phase 3)
 
     task = sanitize(task)
 
@@ -679,11 +990,23 @@ def do_update_result(args):
     # - user confirmed + success → upload (system learns from wins)
     # - user confirmed + failure → upload (system learns from failures)
     # - user rejected / no confirmation / off-topic → local only, no upload
-    should_upload = user_confirmed
+    should_upload = task.get("user_confirmed", False)
 
     if should_upload:
-        # Save as final report
-        report_file = PENDING_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        # Idempotency: check if a report for this task_id already exists (e.g. from hook)
+        report_file = None
+        task_id = task.get("task_id", "")
+        if task_id:
+            for existing in PENDING_DIR.glob("*.json"):
+                try:
+                    existing_data = json.loads(existing.read_text())
+                    if existing_data.get("task_id") == task_id:
+                        report_file = existing  # reuse existing file
+                        break
+                except Exception:
+                    continue
+        if report_file is None:
+            report_file = PENDING_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         with open(report_file, "w") as f:
             json.dump(task, f, indent=2, ensure_ascii=False)
 
@@ -1128,7 +1451,15 @@ def do_install_capability(args):
     import shlex
 
     def _run_cmd(cmd_str):
-        """Run a fixed catalog command safely without shell=True."""
+        """Run a command from CAPABILITY_CATALOG.
+
+        Uses shell=True when the command contains shell metacharacters
+        (pipes, redirections, &&). This is safe because all commands
+        originate from the hardcoded CAPABILITY_CATALOG, not user input.
+        """
+        import re
+        if re.search(r'[|><]|&&', cmd_str):
+            return subprocess.run(cmd_str, shell=True, capture_output=True, text=True)
         try:
             parts = shlex.split(cmd_str)
         except ValueError:
@@ -1211,7 +1542,7 @@ def _detect_locale() -> dict:
     # 4. Python locale
     if not lang:
         try:
-            loc = locale.getdefaultlocale()[0] or ""
+            loc = locale.getlocale()[0] or ""
             if loc and loc not in ("C", "POSIX"):
                 lang = loc
         except Exception:
@@ -2295,7 +2626,7 @@ def main():
     p_update.add_argument("--execution-plan", default="", help="Structured execution plan text from Phase 2")
     p_update.add_argument("--error-detail", default="", help="Structured error: [Turn N] error_type: message")
     p_update.add_argument("--skills-detail", default="", help="JSON array of skill detail objects")
-    p_update.add_argument("--user-confirmed", default="false", help="Whether user confirmed the plan in Phase 3 (true/false). Only confirmed tasks are uploaded.")
+    p_update.add_argument("--user-confirmed", default="", help="Whether user confirmed the plan in Phase 3 (true/false). If omitted, preserves value from confirm-task.")
 
     # feedback
     p_feedback = subparsers.add_parser("feedback")
@@ -2382,6 +2713,24 @@ def main():
     subparsers.add_parser("enable")
     subparsers.add_parser("status")
 
+    # confirm-task / track-progress (Phase 3/4 incremental tracking)
+    p_confirm_task = subparsers.add_parser("confirm-task")
+    p_confirm_task.add_argument("--based-on", default="")
+    p_progress = subparsers.add_parser("track-progress")
+    p_progress.add_argument("--step-completed", default="")
+    p_progress.add_argument("--deliverable", default="")
+    p_progress.add_argument("--tool-used", default="")
+
+    # track-capability (record installed capability in current_task.json)
+    p_track_cap = subparsers.add_parser("track-capability")
+    p_track_cap.add_argument("--name", required=True, help="Capability name to record")
+
+    # finalize-task (Phase 5 simplified: auto-aggregates from current_task.json)
+    p_finalize = subparsers.add_parser("finalize-task")
+    p_finalize.add_argument("--success", default="true")
+    p_finalize.add_argument("--output-summary", default="")
+    p_finalize.add_argument("--output-file", default="")
+
     # find-skill
     p_find_skill = subparsers.add_parser("find-skill")
     p_find_skill.add_argument("query", nargs="?", default="", help="Search keyword(s)")
@@ -2466,6 +2815,14 @@ def main():
         do_register_skill(args)
     elif args.command == "discard-task":
         do_discard_task(args)
+    elif args.command == "confirm-task":
+        do_confirm_task(args)
+    elif args.command == "track-progress":
+        do_track_progress(args)
+    elif args.command == "finalize-task":
+        do_finalize_task(args)
+    elif args.command == "track-capability":
+        do_track_capability(args)
     else:
         parser.print_help()
 

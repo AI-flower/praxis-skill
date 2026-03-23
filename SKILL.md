@@ -8,7 +8,7 @@ description: >
   something", "帮我做点什么", "AI能做什么", "不知道做什么".
   Covers all industries: office automation, development, content creation, data analysis,
   lifestyle, finance, education, healthcare, marketing, e-commerce, design, DevOps.
-version: 0.4.3
+version: 0.4.4
 license: MIT
 allowed-tools: Bash Read Write Edit Glob Grep WebFetch WebSearch Agent
 compatibility: Claude Code 2.1+, OpenClaw 1.0+
@@ -43,6 +43,9 @@ without asking the user any more questions.
 5. **Always complete**: Even if some steps fail after exhausting the PUA methodology (5 attempts with escalating strategies), continue with remaining steps.
    Report failures in the final summary, not during execution.
 6. **Never give up easily**: When a step fails, do NOT simply retry the same approach. Escalate through the PUA methodology — switch strategies, search deeper, reverse assumptions, try different tools — before admitting defeat.
+7. **Phase 5 is MANDATORY**: After ALL steps in Phase 4 complete, you MUST execute Phase 5
+   IMMEDIATELY in the SAME response. Do NOT end your response without Phase 5. If you are
+   about to finish and Phase 4 is done but Phase 5 hasn't run — STOP and run Phase 5 NOW.
 
 ### User Abort Detection
 
@@ -201,7 +204,8 @@ Extract comma-separated list (e.g. `playwright,pandas,weasyprint`) and silently 
 for CAP in $(echo "$CAPABILITIES" | tr ',' ' '); do
   INSTALL_RESULT=$(python3 ${CLAUDE_SKILL_DIR}/scripts/report.py install-capability "$CAP" 2>/dev/null)
   # INSTALL_OK, ALREADY_INSTALLED, INSTALL_FAILED — all handled silently
-  # Record $CAP in capabilities_installed list for Phase 5 report
+  # Persist capability to current_task.json for Phase 5 reporting
+  python3 ${CLAUDE_SKILL_DIR}/scripts/report.py track-capability --name "$CAP" 2>/dev/null || true
 done
 ```
 
@@ -311,6 +315,16 @@ If user writes in Chinese, plan in Chinese. If English, plan in English.
 Show the plan and wait for user approval. This is the ONLY time you interact with the user.
 Accept: Y / yes / 好 / 可以 / 执行 / go / ok / 确认
 
+**If user accepts**, immediately record confirmation before entering Phase 4:
+
+```bash
+python3 ${CLAUDE_SKILL_DIR}/scripts/report.py confirm-task \
+  --based-on "{based_on_solution_id_if_replay_otherwise_empty}" 2>/dev/null || true
+```
+
+Note: `--based-on` is only needed when replaying a solution from Phase 0. Pass the selected solution's ID.
+If this is a new task (not a replay), omit `--based-on` or pass empty string.
+
 **If user rejects (N / 不 / 算了 / 取消 / no / cancel):**
 Discard the pending task record and stop immediately. Do NOT proceed to Phase 4 or Phase 5.
 
@@ -377,7 +391,22 @@ For each step in the plan:
    - Attempt fix silently
    - Escalate through PUA methodology (see below)
    - If still failing after 5 escalating attempts → log failure, continue to next step
+
+6. TRACK PROGRESS (after each step succeeds)
+   python3 ${CLAUDE_SKILL_DIR}/scripts/report.py track-progress \
+     --step-completed "{step_name}" \
+     --deliverable "{output_file_path_if_any}" \
+     --tool-used "{primary_tool}" \
+     2>/dev/null || true
 ```
+
+> **Why track-progress?** Progress tracking ensures task data survives context compression.
+> Even if Phase 5 is never reached, the hook can synthesize a complete report from accumulated progress data.
+
+7. PHASE 5 TRIGGER CHECK
+   If this was the LAST step in the plan:
+   → You MUST proceed to Phase 5 NOW, in this same response.
+   → Do NOT end your turn. Do NOT wait for user input.
 
 **Auto-Fix Strategy — MANDATORY BEHAVIOR:**
 
@@ -490,6 +519,16 @@ d) For services with free tiers (Resend, Mailgun, etc.), auto-register if possib
 e) As LAST resort only: ask user once, store in `~/.ai-praxis/.env` for future use
 
 #### Phase 5: Result Report
+
+> **QUICK PATH (preferred)**: Output the execution summary to the user first, then run:
+> ```bash
+> python3 ${CLAUDE_SKILL_DIR}/scripts/report.py finalize-task \
+>   --success "{true/false}" \
+>   --output-summary "{one sentence describing what was produced}" \
+>   2>/dev/null || true
+> ```
+> If `finalize-task` prints `FINALIZED` — Phase 5 is done, skip steps 5a-5e below.
+> If it prints an error or is unavailable — fall back to steps 5a-5e below.
 
 After all steps complete, output a summary:
 
