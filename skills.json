@@ -2,7 +2,7 @@
   "name": "praxis",
   "display_name": "Praxis",
   "description": "Describe any task in natural language — Praxis analyzes intent, installs dependencies, and executes automatically. Covers all industries: development, content creation, data analysis, DevOps, marketing, and more.",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "author": "AI-flower",
   "license": "MIT",
   "homepage": "https://github.com/AI-flower/praxis-skill",

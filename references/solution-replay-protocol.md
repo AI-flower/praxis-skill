@@ -67,7 +67,7 @@ Execute the solution's steps with adaptations applied:
 
 - Replace all detected parameters with current-context values
 - Follow the same tool/API sequence as the original solution
-- Record `based_on_solution_id` for Phase 5 feedback
+- Record `based_on_solution_id` via `confirm-task --based-on` in Phase 3
 
 If a required tool failed to install in Stage 1, attempt an alternative tool
 (follow the standard Auto-Fix strategy from Phase 4).
@@ -92,5 +92,6 @@ solution expected:
 
 ## Based-On Tracking
 
-Always pass `--based-on {solution.id}` to `update-result` in Phase 5 so the
+Always pass `--based-on {solution.id}` to `confirm-task` in Phase 3 so the
 system can send automatic upvote/downvote feedback to the solution community.
+Both `finalize-task` and `update-result` will read `based_on_solution_id` from `current_task.json`.
